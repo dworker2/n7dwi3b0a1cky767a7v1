@@ -1,0 +1,93 @@
+name: Worker
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: worker-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  worker:
+    name: Worker Container
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Configure Docker for insecure registry
+        env:
+          REGISTRY_ENDPOINT: ${{ secrets.REGISTRY_ENDPOINT }}
+        run: |
+          echo "Configuring Docker to allow insecure registry: $REGISTRY_ENDPOINT"
+          echo '{"insecure-registries": ["'"$REGISTRY_ENDPOINT"'"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          sleep 5
+
+      - name: Log in to private registry
+        env:
+          REGISTRY_ENDPOINT: ${{ secrets.REGISTRY_ENDPOINT }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          echo "Logging in to private registry: $REGISTRY_ENDPOINT"
+          echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_ENDPOINT" -u "$REGISTRY_USERNAME" --password-stdin
+
+      - name: Checkout main repository for scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.MAIN_REPO }}
+          token: ${{ secrets.MAIN_REPO_TOKEN }}
+          path: main-repo
+
+      - name: Run worker container
+        env:
+          RABBITMQ_URL: ${{ secrets.RABBITMQ_URL }}
+          RABBITMQ_BASE_QUEUE_NAME: ${{ secrets.RABBITMQ_BASE_QUEUE_NAME }}
+          RABBITMQ_EXCHANGE: ${{ secrets.RABBITMQ_EXCHANGE }}
+          WORKER_TIMEOUT_MS: ${{ secrets.WORKER_TIMEOUT_MS }}
+          WORKER_NAME: ${{ secrets.WORKER_NAME }}
+          WORKER_TYPE: ${{ secrets.WORKER_TYPE }}
+          WORKER_GITHUB_ACCOUNT_ID: ${{ secrets.WORKER_GITHUB_ACCOUNT_ID }}
+          WORKER_IMAGE: ${{ secrets.WORKER_IMAGE }}
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY_ID }}
+          MINIO_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_ACCESS_KEY }}
+          MINIO_USE_SSL: ${{ secrets.MINIO_USE_SSL }}
+          MINIO_BUCKET_NAME: ${{ secrets.MINIO_BUCKET_NAME }}
+          REGISTRY_ENDPOINT: ${{ secrets.REGISTRY_ENDPOINT }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          LOKI_ENDPOINT: ${{ secrets.LOKI_ENDPOINT }}
+          NODE_ENV: production
+        run: |
+          chmod +x main-repo/apps/worker/scripts/docker-run-worker.sh || true
+          main-repo/apps/worker/scripts/docker-run-worker.sh || {
+            echo "Failed to run worker container"
+            exit 1
+          }
+
+      - name: Wait for worker to start
+        run: |
+          sleep 10
+          docker logs bbm-worker || true
+
+      - name: Keep container running
+        run: |
+          timeout 10700 docker logs -f bbm-worker || true
+          if docker ps | grep -q bbm-worker; then
+            docker logs --tail 50 bbm-worker || true
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if docker ps | grep -q bbm-worker; then
+            docker stop --time=300 bbm-worker || true
+          fi
+          docker rm bbm-worker || true
+          docker image prune -f || true
